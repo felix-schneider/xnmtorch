@@ -1,0 +1,9 @@
+torch>=1.1
+apex>=0.1
+numpy
+pyyaml
+torchtext>=0.4
+torchvision>=0.3
+tensorboard>=1.14
+future
+sacrebleu

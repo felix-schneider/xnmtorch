@@ -1,11 +1,35 @@
+import random
+from argparse import ArgumentParser
 
-OVERWRITE_LOG = False
-# IMMEDIATE_COMPUTE = False
-CHECK_VALIDITY = False
-RESOURCE_WARNINGS = False
-PRINT_CG_ON_ERROR = False
+import numpy as np
+import torch
+
 LOG_LEVEL_CONSOLE = "INFO"
 LOG_LEVEL_FILE = "DEBUG"
-DEFAULT_MOD_PATH = "{EXP_DIR}/models/{EXP}.mod"
-DEFAULT_LOG_PATH = "{EXP_DIR}/logs/{EXP}.log"
-DEFAULT_REPORT_PATH = "{EXP_DIR}/reports/{EXP}"
+DEFAULT_CHECKPOINT_DIR = "checkpoints"
+DEFAULT_REPORT_DIR = "reports"
+DEFAULT_LOG_DIR = "logs"
+CUDA = False
+FP16 = "O0"  # Optimization level for amp
+DEBUG = False
+
+
+def add_arguments(parser: ArgumentParser):
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--cuda", action="store_true")
+    parser.add_argument("--fp16", default="O0", choices=["O0", "O1", "O2", "O3"])
+    parser.add_argument("--debug", action="store_true")
+
+
+def resolve_arguments(args):
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+
+    global FP16, CUDA, OVERWRITE_LOG, LOG_LEVEL_CONSOLE, DEBUG
+    FP16 = args.fp16
+    CUDA = args.cuda
+    if args.debug:
+        LOG_LEVEL_CONSOLE = "DEBUG"
+        DEBUG = True

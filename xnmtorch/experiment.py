@@ -1,135 +1,151 @@
-from typing import Sequence
+import os
+from pickle import UnpicklingError
+from typing import Sequence, Union, Optional
 
-from xnmtorch import settings, logger
-from xnmtorch.persistence.serializable import Serializable
+import torch
+import yaml
+from apex import amp
+from yaml.parser import ParserError
+
+from xnmtorch import settings
+from xnmtorch.eval.eval_tasks import EvalTask
+from xnmtorch.eval.metrics import Metric
+from xnmtorch.models import Model
+from xnmtorch.persistence.serializable import Serializable, UninitializedYamlObject
+from xnmtorch.train.regimens import TrainingRegimen
+from xnmtorch.train.train_tasks import CheckpointReport
 
 
 class ExpGlobal(Serializable):
-    """
-    An object that holds global settings that can be referenced by components wherever appropriate.
-
-    Args:
-      model_file: Location to write model file to
-      log_file: Location to write log file to
-      dropout: Default dropout probability that should be used by supporting components but can be overwritten
-      weight_noise: Default weight noise level that should be used by supporting components but can be overwritten
-      default_layer_dim: Default layer dimension that should be used by supporting components but can be overwritten
-      param_init: Default parameter initializer that should be used by supporting components but can be overwritten
-      bias_init: Default initializer for bias parameters that should be used by supporting components but can be overwritten
-      truncate_dec_batches: whether the decoder drops batch elements as soon as these are masked at some time step.
-      save_num_checkpoints: save DyNet parameters for the most recent n checkpoints, useful for model averaging/ensembling
-      loss_comb_method: method for combining loss across batch elements ('sum' or 'avg').
-      commandline_args: Holds commandline arguments with which XNMT was launched
-      placeholders: these will be used as arguments for a format() call applied to every string in the config.
-                    For example, ``placeholders: {"PATH":"/some/path"} will cause each occurence of ``"{PATH}"`` in a
-                    string to be replaced by ``"/some/path"``. As a special variable, ``EXP_DIR`` can be specified to
-                    overwrite the default location for writing models, logs, and other files.
-    """
-
     def __init__(self,
-                 model_file: str = settings.DEFAULT_MOD_PATH,
-                 log_file: str = settings.DEFAULT_LOG_PATH,
+                 checkpoint_dir: str = settings.DEFAULT_CHECKPOINT_DIR,
+                 report_dir: str = settings.DEFAULT_REPORT_DIR,
                  dropout: float = 0.3,
-                 weight_noise: float = 0.0,
+                 weight_noise: float = 0.0,  # currently unused
+                 multiple: int = 1,
                  default_layer_dim: int = 512,
-                 # param_init
-                 # bias_init
-                 # truncate_dec_batches: bool = False
-                 save_num_checkpoints: int = 1,
-                 loss_comb_method: str = "sum",
-                 commandline_args: dict = {},
-                 placeholders: dict = {}
-                 ):
-        self.model_file = model_file
-        self.log_file = log_file
+                 save_num_checkpoints: int = 1):
+        self.checkpoint_dir = checkpoint_dir
+        self.report_dir = report_dir
         self.dropout = dropout
         self.weight_noise = weight_noise
+        self.multiple = multiple
         self.default_layer_dim = default_layer_dim
-        # self.param_init = param_init
-        # self.bias_init = bias_init
-        # self.truncate_dec_batches = truncate_dec_batches
-        self.commandline_args = commandline_args
         self.save_num_checkpoints = save_num_checkpoints
-        self.loss_comb_method = loss_comb_method
-        self.placeholders = placeholders
 
 
 class Experiment(Serializable):
-    """
-    A default experiment that performs preprocessing, training, and evaluation.
-
-    The initializer calls ParamManager.populate(), meaning that model construction should be finalized at this point.
-    __call__() runs the individual steps.
-
-    Args:
-      name: name of experiment
-      exp_global: global experiment settings
-      preproc: carry out preprocessing if specified
-      model: The main model. In the case of multitask training, several models must be specified, in which case the models will live not here but inside the training task objects.
-      train: The training regimen defines the training loop.
-      evaluate: list of tasks to evaluate the model after training finishes.
-      random_search_report: When random search is used, this holds the settings that were randomly drawn for documentary purposes.
-      status: Status of the experiment, will be automatically set to "done" in saved model if the experiment has finished running.
-    """
-
     def __init__(self,
-                 name: str,
                  exp_global: ExpGlobal,
-                 preproc = None,
-                 model = None,
-                 train = None,
-                 evaluate = None,
-                 status = None):
-        self.name = name
+                 model: Model,
+                 train: Optional[TrainingRegimen] = None,
+                 evaluate: Optional[Union[EvalTask, Sequence[EvalTask]]] = None,):
         self.exp_global = exp_global
-        self.preproc = preproc
         self.model = model
+        if settings.CUDA:
+            self.model.cuda()
+
         self.train = train
+        if evaluate is not None and not isinstance(evaluate, Sequence):
+            evaluate = [evaluate]
         self.evaluate = evaluate
-        self.status = status
 
-    def dump(self):
-        specs = super().dump()
-        state = self.model.state_dict()
-        return {"specs": specs, "state": state}
+    @classmethod
+    def load_experiment(cls, filename, spec_filename=None, for_training=False):
+        try:
+            # try to load as a checkpoint
+            checkpoint = torch.load(filename, map_location="cpu")
+            spec = checkpoint["spec"]
+            state = checkpoint["state"]
+        except UnpicklingError:
+            # was just a spec
+            with open(filename) as spec_file:
+                spec = spec_file.read()
+            state = None
 
-    @staticmethod
-    def load(stream):
-        if isinstance(stream, str):
-            return Serializable.load(stream)
-        else:
-            obj = Serializable.load(stream["specs"])
-            obj.load_state_dict(stream["state"])
+        if state is None and spec_filename is not None:
+            raise ValueError("Was instructed to load a spec, but no state was given")
+        elif spec_filename is not None:
+            with open(spec_filename) as spec_file:
+                spec = spec_file.read()
 
-    def __call__(self) -> Sequence[metrics.EvalScore]:
-        """
-        Launch training loop, followed by final evaluation.
-        """
-        eval_scores = ["Not evaluated"]
-        if self.status != "done":
-            if self.train is not None:
-                logger.info("Starting training")
-                self.train.run_training()
-                # logger.info('Reverting learned weights to best checkpoint..')
-                # try:
-                #     param_collections.ParamManager.param_col.revert_to_best_model()
-                # except param_collections.RevertingUnsavedModelException:
-                #     pass
+        experiment = yaml.full_load(spec)
 
-            evaluate_args = self.evaluate
-            if evaluate_args:
-                logger.info("Performing final evaluation")
-                eval_scores = []
-                for evaluator in evaluate_args:
-                    eval_score = evaluator.eval()
-                    if type(eval_score) == list:
-                        eval_scores.extend(eval_score)
-                    else:
-                        eval_scores.append(eval_score)
+        if not isinstance(experiment, UninitializedYamlObject) or experiment.cls is not Experiment:
+            raise ValueError(f"Top level object must be an Experiment")
 
-            self.save_processed_arg("status", "done")
-            save_fct()
-        else:
-            logger.info("Experiment already finished, skipping.")
+        if not for_training:
+            del experiment.yaml_args["train"]
 
+        experiment = experiment.initialize()
+
+        if state is not None:
+            experiment.load_state_dict(state)
+
+        return experiment
+
+    @classmethod
+    def load_model(cls, filename):
+        checkpoint = torch.load(filename, map_location="cpu")
+        spec = checkpoint["spec"]
+        state = checkpoint["state"]
+        experiment = yaml.full_load(spec)
+
+        if not isinstance(experiment, UninitializedYamlObject) or experiment.cls is not Experiment:
+            raise ValueError(f"Top level object must be an Experiment")
+
+        if "train" in experiment.yaml_args:
+            del experiment.yaml_args["train"]
+        if "evaluate" in experiment.yaml_args:
+            del experiment.yaml_args["evaluate"]
+
+        experiment = experiment.initialize()
+        experiment.load_state_dict(state)
+        return experiment.model
+
+    def save(self, dev_report: CheckpointReport):
+        cp_dir = self.exp_global.checkpoint_dir
+        os.makedirs(cp_dir, exist_ok=True)
+
+        primary_metric = dev_report.eval_scores[0]
+        filename = f"checkpoint_{str(primary_metric).replace(' ', '_')}_{self.train.step_num}.pt"
+
+        existing_checkpoints = os.listdir(cp_dir)
+        if len(existing_checkpoints) >= self.exp_global.save_num_checkpoints:
+            worst = sorted(existing_checkpoints)[0 if primary_metric.higher_is_better else -1]
+            os.remove(os.path.join(cp_dir, worst))
+
+        spec = self.dump()
+        state = self.state_dict()
+
+        checkpoint = {"spec": spec, "state": state}
+        torch.save(checkpoint, os.path.join(cp_dir, filename))
+
+    def state_dict(self) -> dict:
+        state_dict = {"model": self.model.state_dict()}
+        if self.train is not None:
+            state_dict["train"] = self.train.state_dict()
+        return state_dict
+
+    def load_state_dict(self, state_dict: dict):
+        self.model.load_state_dict(state_dict["model"], strict=False)
+        if self.train is not None:
+            self.train.load_state_dict(state_dict["train"])
+
+    def __call__(self) -> Sequence[Metric]:
+        if self.train is not None:
+            self.train.run_training(save_fct=self.save)
+
+        eval_scores = []
+        if self.evaluate is not None:
+            for task in self.evaluate:
+                eval_scores.extend(task.eval())
         return eval_scores
+
+
+def _load_model(loader: yaml.Loader, node):
+    path = loader.construct_python_str(node)
+    return Experiment.load_model(path)
+
+
+yaml.FullLoader.add_constructor("!LoadModel", _load_model)

@@ -2,30 +2,35 @@ import inspect
 import logging
 from enum import Enum, auto
 from functools import singledispatch, wraps
+from typing import Any
 
 import yaml
 
-from xnmtorch.persistence.format_string import FormatString
 from xnmtorch.persistence.path import Path, PathError
 
-
-logger = logging.getLogger("persistence")
+logger = logging.getLogger("deserialize")
 
 
 def _make_yaml_loader(cls):
     def from_yaml(loader, node):
         yaml_args = loader.construct_mapping(node)
         return UninitializedYamlObject(cls, yaml_args)
+
     return from_yaml
 
 
 def _make_yaml_representer(yaml_tag):
     def to_yaml(dumper, data):
         return dumper.represent_mapping(yaml_tag, data._yaml_args)
+
     return to_yaml
 
 
-def _serializable_init(__init__):
+class DeserializeError(RuntimeError):
+    pass
+
+
+def _serializable_init(cls, __init__):
     @wraps(__init__)
     def wrapper(self, *args, **kwargs):
         all_params = dict(kwargs)
@@ -56,8 +61,16 @@ def _serializable_init(__init__):
                         raise ValueError(f"Cannot pass a reference as argument; received {all_params[key]} "
                                          f"in {type(self).__name__}.__init__()")
 
-        __init__(self, **all_params)
+        # for bare() default arguments
+        for key, arg in list(all_params.items()):
+            if isinstance(arg, UninitializedYamlObject):
+                logger.debug(f"Initializing bare {arg.cls.__name__} in {cls.__name__}")
+                initialized = arg.initialize()
+                all_params[key] = initialized
+
         self._yaml_args = all_params
+        __init__(self, **all_params)
+
     return wrapper
 
 
@@ -69,7 +82,14 @@ class Serializable:
         if yaml_tag is None:
             yaml_tag = f"!{cls.__name__}"
 
-        cls.__init__ = _serializable_init(cls.__init__)
+        init_params = inspect.signature(cls.__init__).parameters
+        for param in init_params.values():
+            if param.default != inspect.Parameter.empty and isinstance(param.default, Serializable):
+                logger.warning(f"{cls.__name__}.__init__ parameter {param.name} default is Serializable, "
+                               f"this is not recommended, use bare({param.default.__class__.__name__}) instead."
+                               f" Doing so will allow parameter sharing.")
+
+        cls.__init__ = _serializable_init(cls, cls.__init__)
 
         yaml.FullLoader.add_constructor(yaml_tag, _make_yaml_loader(cls))
         yaml.Dumper.add_representer(cls, _make_yaml_representer(yaml_tag))
@@ -89,6 +109,32 @@ class Serializable:
         Note that this does not clone object state.
         """
         return self.__class__(**self._yaml_args)
+
+    def save_processed_arg(self, key: str, val: Any):
+        """
+        Save a new value for an init argument (call from within ``__init__()``).
+
+        Normally, the serialization mechanism makes sure that the same arguments are passed when creating the class
+        initially based on a config file, and when loading it from a saved model. This method can be called from inside
+        ``__init__()`` to save a new value that will be passed when loading the saved model. This can be useful when one
+        doesn't want to recompute something every time (like a vocab) or when something has been passed via implicit
+        referencing which might yield inconsistent result when loading the model to assemble a new model of different
+        structure.
+
+        Args:
+          key: name of property, must match an argument of ``__init__()``
+          val: new value; a :class:`Serializable` or basic Python type or list or dict of these
+        """
+        if key not in inspect.signature(self.__init__).parameters:
+            raise ValueError(f"{key} is not an init argument of {self}")
+        self._yaml_args[key] = val
+
+
+def add_alias(yaml_tag, cls):
+    assert issubclass(cls, Serializable)
+
+    yaml.FullLoader.add_constructor(yaml_tag, _make_yaml_loader(cls))
+    yaml.Dumper.add_representer(cls, _make_yaml_representer(yaml_tag))
 
 
 class Ref(metaclass=yaml.YAMLObjectMetaclass):
@@ -124,6 +170,20 @@ class Ref(metaclass=yaml.YAMLObjectMetaclass):
     def __repr__(self):
         return str(self)
 
+    def __hash__(self):
+        h = hash(self.path)
+        if not self.required:
+            try:
+                h |= hash(self.default)
+            except TypeError as e:
+                raise TypeError("Unhashable Ref") from e
+        return h
+
+    def __eq__(self, other):
+        if not isinstance(other, Ref):
+            return False
+        return self.path == other.path and self.default == other.default
+
     @classmethod
     def from_yaml(cls, loader, node):
         args = loader.construct_mapping(node)
@@ -137,6 +197,11 @@ class Ref(metaclass=yaml.YAMLObjectMetaclass):
         return dumper.represent_mapping(cls.yaml_tag, mapping)
 
 
+def bare(cls, **kwargs):
+    assert issubclass(cls, Serializable)
+    return UninitializedYamlObject(cls, kwargs)
+
+
 class UninitializedYamlObject:
     def __init__(self, cls, yaml_args):
         assert issubclass(cls, Serializable)
@@ -144,15 +209,13 @@ class UninitializedYamlObject:
         self.yaml_args = yaml_args
         self.obj = None
 
-    def initialize(self, format_dict=None):
+    def initialize(self):
         """
         Initialize this object and all children.
         This object is the root of the reference tree
         :return: Serializable
         """
-        # check args
-        self._format_strings(format_dict or {})
-        self._resolve_ref_default_args()
+        self._resolve_bare_and_ref_default_args()
         self._create_referenced_default_args()
         self._share_init_params_top_down()
         self._init_components_bottom_up()
@@ -162,47 +225,24 @@ class UninitializedYamlObject:
     def init_arg_defaults(self):
         return inspect.signature(self.cls.__init__).parameters
 
-    def _format_strings(self, format_dict):
-        try:
-            format_dict.update(_get_descendant(self, Path("exp_global.placeholders")))
-        except PathError:
-            pass
-        if len(format_dict) == 0:
-            return
-
+    def _resolve_bare_and_ref_default_args(self, prefix=Path()):
+        """
+        If an argument is not given in the YAML file and is set to a Ref or a bare object by default
+        (e.g. dropout=Ref("exp_global.dropout")), copy this Ref into the yaml_args
+        """
         for path, node in _traverse_tree(self):
-            if isinstance(node, str):
-                try:
-                    formatted = node.format(**format_dict)
-                except (ValueError, KeyError, IndexError):
-                    formatted = node
-                if node != formatted:
-                    _set_descendant(self, path, FormatString(formatted, node))
-            elif isinstance(node, UninitializedYamlObject):
-                init_args_defaults = node.init_arg_defaults
-                for expected_arg in init_args_defaults:
-                    if expected_arg not in [x[0] for x in _name_children(node)]:
-                        arg_default = init_args_defaults[expected_arg].default
-                        if isinstance(arg_default, str):
-                            try:
-                                formatted = arg_default.format(**format_dict)
-                            except (ValueError, KeyError):  # will occur e.g. if a vocab entry contains a curly bracket
-                                formatted = arg_default
-                            if arg_default != formatted:
-                                node.yaml_args[expected_arg] = FormatString(formatted, arg_default)
-
-    def _resolve_ref_default_args(self):
-        """
-        If an argument is not given in the YAML file and is set to a Ref by default
-        (e.g. dropout=Ref("exp_global.dropout")), copy this Ref into the implicit_args
-        """
-        for _, node in _traverse_tree(self):
             if isinstance(node, UninitializedYamlObject):
                 init_args_defaults = node.init_arg_defaults
                 for expected_arg in init_args_defaults:
                     if expected_arg not in node.yaml_args:
                         arg_default = init_args_defaults[expected_arg].default
+                        abs_path = prefix.add_path(path).append(expected_arg)
                         if isinstance(arg_default, Ref):
+                            logger.debug(f"Adding default Ref {abs_path} -> {arg_default.path}")
+                            node.yaml_args[expected_arg] = arg_default
+                        elif isinstance(arg_default, UninitializedYamlObject):
+                            logger.debug(f"Adding default bare at {abs_path}")
+                            arg_default._resolve_bare_and_ref_default_args(prefix=abs_path)
                             node.yaml_args[expected_arg] = arg_default
 
     def _create_referenced_default_args(self):
@@ -231,6 +271,7 @@ class UninitializedYamlObject:
                             else:
                                 referenced_arg_default = inspect.Parameter.empty
                             if referenced_arg_default != inspect.Parameter.empty:
+                                logger.debug(f"Adding Ref to implicit argument {path} -> {referenced_path}")
                                 # make the default arg an implicit arg so the Ref can be resolved
                                 _set_descendant(self, ancestor, referenced_arg_default)
                         else:
@@ -267,25 +308,47 @@ class UninitializedYamlObject:
 
                 for _, child_of_shared_param in _traverse_tree(new_shared_val, include_root=False):
                     if isinstance(child_of_shared_param, UninitializedYamlObject):
-                        raise ValueError(f"{shared_param_path} shared params {shared_param_set} contians Serializable"
-                                         f"sub-object {child_of_shared_param} which is not permitted")
-                if not isinstance(new_shared_val, Ref):
-                    shared_val_choices.add(new_shared_val)
+                        logger.warning(f"{shared_param_path} shared params {shared_param_set} contains Serializable"
+                                       f"sub-object {child_of_shared_param} which does not support parameter sharing")
+                shared_val_choices.add(new_shared_val)
             if len(shared_val_choices) == 0:
-                logger.warning(f"No param choices at for {shared_param_set}")
-            elif len(shared_val_choices) > 1:
-                logger.warning(f"inconsistent shared params for {shared_param_set}: "
-                               f"{shared_val_choices}; Ignoring these shared parameters.")
-            else:
+                # try and go by defaults
                 for shared_param_path in shared_param_set:
                     try:
-                        if shared_param_path[-1] in \
-                                _get_descendant(self, shared_param_path.parent()).init_arg_defaults:
-                            _set_descendant(self, shared_param_path, list(shared_val_choices)[0])
+                        parent = _get_descendant(self, shared_param_path.parent())
+                    except PathError:
+                        continue
+                    if not isinstance(parent, UninitializedYamlObject):
+                        continue
+                    init_args_defaults = parent.init_arg_defaults
+                    param_name = shared_param_path[-1]
+                    if param_name in init_args_defaults and \
+                            init_args_defaults[param_name].default != inspect.Parameter.empty:
+                        shared_val_choices.add(init_args_defaults[param_name].default)
+                    else:
+                        continue
+
+            if len(shared_val_choices) == 0:
+                logger.warning(f"No param choices for {shared_param_set}")
+            elif len(shared_val_choices) > 1:
+                raise DeserializeError(f"inconsistent shared params for {shared_param_set}: "
+                                       f"{shared_val_choices}; Ignoring these shared parameters.")
+            else:
+                logger.debug(f"Sharing parameters {shared_param_set} = {next(iter(shared_val_choices))}")
+                for shared_param_path in shared_param_set:
+                    try:
+                        descendant = _get_descendant(self, shared_param_path.parent())
                     except PathError:
                         # can happen when the shared path contained a reference,
                         # which we don't follow to avoid unwanted effects
-                        pass
+                        continue
+                    if descendant is None:
+                        continue
+                    elif not isinstance(descendant, UninitializedYamlObject):
+                        raise ValueError(f"Error when trying to share attribute {shared_param_path[-1]} "
+                                         f"of {type(descendant).__name__}")
+                    elif shared_param_path[-1] in descendant.init_arg_defaults:
+                        _set_descendant(self, shared_param_path, list(shared_val_choices)[0])
 
     def _init_components_bottom_up(self):
         cache = dict()
@@ -293,14 +356,20 @@ class UninitializedYamlObject:
             if isinstance(node, Ref):
                 cache_size = len(cache)
                 initialized_component = self._resolve_ref(node, cache)
+                logger.debug(f"Resolved Ref {path} -> {node.path}")
                 if len(cache) == cache_size:
-                    logger.debug(f"For {path}: reusing previously initialized {initialized_component}")
+                    logger.debug(f"For {path}: Reusing {_obj_to_str(initialized_component)}")
             elif isinstance(node, UninitializedYamlObject):
                 for name, _ in _name_children(node):
                     initialized_child = cache[path.append(name)]
                     node.yaml_args[name] = initialized_child
 
                 initialized_component = node._init_component()
+                logger.debug(f"In {path}: Initialized {_obj_to_str(initialized_component)}")
+            elif isinstance(node, list):
+                initialized_component = [cache[path.append(str(i))] for i in range(len(node))]
+            elif isinstance(node, dict):
+                initialized_component = {key: cache[path.append(key)] for key in node.keys()}
             else:
                 initialized_component = node
             cache[path] = initialized_component
@@ -314,11 +383,10 @@ class UninitializedYamlObject:
                 initialized_component = _get_descendant(self, resolved_path)
                 if isinstance(initialized_component, UninitializedYamlObject):
                     initialized_component = initialized_component._init_component()
-            except PathError:
-                print(resolved_path)
+            except PathError as e:
                 if node.required:
                     # initialized_component = None
-                    raise ReferenceError(str(resolved_path))
+                    raise ReferenceError(str(resolved_path)) from e
                 else:
                     initialized_component = node.default
             cache[resolved_path] = initialized_component
@@ -329,10 +397,22 @@ class UninitializedYamlObject:
             return self.obj
         # check types
         assert not any(isinstance(param, UninitializedYamlObject) for param in self.yaml_args.values())
-        obj = self.cls(**self.yaml_args)
-        logger.debug(f"Initialized {self.cls.__name__}@{id(obj)}({self.yaml_args})"[:1000])
+        try:
+            obj = self.cls(**self.yaml_args)
+        except Exception as e:
+            raise DeserializeError(f"Deserialization of {self.cls.__name__} failed") from e
         self.obj = obj
         return obj
+
+    def __str__(self):
+        return f"UninitializedYamlObject<{self.cls.__name__}>@{id(self)}({self.yaml_args.keys()})"
+
+
+def _obj_to_str(obj):
+    if isinstance(obj, (int, str, float, bool, UninitializedYamlObject)):
+        return str(obj)
+    else:
+        return obj.__class__.__name__
 
 
 class _TraversalOrder(Enum):
@@ -516,4 +596,3 @@ def _traverse_tree_deep_once(root, cur_node, traversal_order=_TraversalOrder.ROO
         if not (path.ancestors() & yielded_paths):
             yielded_paths.add(path)
             yield (path, node)
-
