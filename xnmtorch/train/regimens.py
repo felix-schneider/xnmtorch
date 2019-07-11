@@ -17,7 +17,7 @@ from xnmtorch.train.lr_schedulers import LearningRateScheduler
 from xnmtorch.models import Model
 from xnmtorch.train.optimizers import Optimizer
 from xnmtorch.persistence import Serializable, Ref
-from xnmtorch.train.train_tasks import TrainingTask
+from xnmtorch.train.train_tasks import TrainingTask, OOMError
 
 
 class TrainingRegimen:
@@ -139,81 +139,32 @@ class SimpleTrainingRegimen(TrainingTask, TrainingRegimen, Serializable):
             elif i == 0:
                 self.logger.info("Starting training")
 
-            try:
-                model_output, loss = self.get_output_and_loss(batch)
-            except RuntimeError as e:
-                if 'out of memory' in str(e) or 'get_temporary_buffer' in str(e):
-                    # TODO: Problem with delay_unscale?
-                    stats = [f"CUDA OOM on forward {i}",
-                             f"Batch size {batch.batch_size} {self.dataset.sample_name}s"] + \
-                            [f"{k}: {v}" for k, v in self.dataset.get_batch_stats(batch).items()]
-                    self.logger.error(" | ".join(stats))
-                    self.logger.error(str(e))
-                    self.optimizer.zero_grad()
-                    del batch
-                    if settings.CUDA:
-                        torch.cuda.empty_cache()
-                    seen_examples = 0
-                    total_loss = 0
-                    report_samples = 0
-                    report_loss = 0
-                    timer = datetime.today()
-                    ooms += 1
-                    print_tensors()
-                    if ooms == 5:
-                        raise e
-                    continue
-                else:
-                    raise e
+            train_this_step = self.update_every is None or backward_steps % self.update_every == 0
 
-            with torch.no_grad():
-                nll = model_output["nll"].sum().item()
-                batch_size = model_output["nll"].ne(0.0).sum().item()
-            del model_output
+            try:
+                nll, batch_size = self.forward_backward_pass(batch, self.optimizer, not train_this_step)
+            except OOMError as e:
+                self.logger.error(str(e))
+                self.optimizer.zero_grad()
+                del batch
+                if settings.CUDA:
+                    torch.cuda.empty_cache()
+                seen_examples = 0
+                total_loss = 0
+                report_samples = 0
+                report_loss = 0
+                timer = datetime.today()
+                ooms += 1
+                # print_tensors()
+                if ooms == 5:
+                    raise e
+                else:
+                    continue
 
             total_loss += nll
             seen_examples += batch_size
             report_loss += nll
             report_samples += batch_size
-
-            if self.logger.getEffectiveLevel() <= logging.DEBUG:
-                stats = [f"Step {i}: {self.dataset.sample_name}s",
-                         f"ppl {math.exp(nll / batch_size):.2f}",
-                         f"Batch size {batch.batch_size} {self.dataset.sample_name}s"] + \
-                        [f"{k}: {v}" for k, v in self.dataset.get_batch_stats(batch).items()]
-                self.logger.debug(" | ".join(stats))
-
-            train_this_step = self.update_every is None or backward_steps % self.update_every == 0
-
-            try:
-                with amp.scale_loss(loss, self.optimizer, delay_unscale=not train_this_step) as scaled_loss:
-                    scaled_loss.backward()
-            except RuntimeError as e:
-                if 'out of memory' in str(e) or 'get_temporary_buffer' in str(e):
-                    stats = [f"CUDA OOM on backward {i}",
-                             f"Batch size {batch.batch_size} {self.dataset.sample_name}s"] + \
-                            [f"{k}: {v}" for k, v in self.dataset.get_batch_stats(batch).items()]
-                    self.logger.error(" | ".join(stats))
-                    self.logger.error(str(e))
-                    self.optimizer.zero_grad()
-                    del loss
-                    del batch
-                    if settings.CUDA:
-                        torch.cuda.empty_cache()
-                    seen_examples = 0
-                    total_loss = 0
-                    report_samples = 0
-                    report_loss = 0
-                    timer = datetime.today()
-                    ooms += 1
-                    print_tensors()
-                    if ooms == 5:
-                        raise e
-                    continue
-                else:
-                    raise e
-            del loss
-
             backward_steps += 1
 
             if train_this_step:

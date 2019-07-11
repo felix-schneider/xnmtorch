@@ -171,13 +171,13 @@ class TranslationDataset(BaseTranslationDataset, TorchTextDataset, Serializable)
     def split_subwords(self, text):
         return self.subword_model.SampleEncodeAsPieces(text, self.subword_nbest, self.subword_alpha)
 
-    @staticmethod
-    def load_parallel_data(source_filename, target_filename, fields):
+    def load_parallel_data(self, source_filename, target_filename, fields):
         examples = []
         with open(source_filename) as src_file, open(target_filename) as trg_file:
             for src_line, trg_line in zip(src_file, trg_file):
-                src_line, trg_line = src_line.rstrip("\n"), trg_line.rstrip("\n")
-                examples.append(Example.fromlist([src_line, trg_line], fields))
+                example = Example.fromlist([src_line, trg_line], fields)
+                if self.filter_example(example):
+                    examples.append(example)
         return examples
 
     @staticmethod
@@ -195,12 +195,19 @@ class TranslationDataset(BaseTranslationDataset, TorchTextDataset, Serializable)
 
 class H5TranslationDataset(BaseTranslationDataset, TorchTextDataset, Serializable):
     class ExampleWrapper:
+        CACHE_SIZE = 100
+
         def __init__(self, ds, fields):
             self.fields = fields
             self.ds = ds
+            self.cache_idx = 0
+            self.cache = self.ds[0:self.CACHE_SIZE]
 
         def __getitem__(self, i):
-            return Example.fromlist(self.ds[i], self.fields)
+            if not (self.cache_idx <= i < self.cache_idx + self.CACHE_SIZE):
+                self.cache_idx = i
+                self.cache = self.ds[i:i + self.CACHE_SIZE]
+            return Example.fromlist(self.cache[i - self.cache_idx], self.fields)
 
         def __len__(self):
             return len(self.ds)

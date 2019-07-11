@@ -1,7 +1,11 @@
+import logging
 import os
+import math
 from collections import namedtuple
 from typing import Optional, Sequence
 
+import torch
+from apex import amp
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 from torchtext.data import Batch
@@ -14,6 +18,10 @@ from xnmtorch.models import Model
 from xnmtorch.persistence import Serializable, Ref
 
 CheckpointReport = namedtuple("CheckpointReport", ["has_improved", "eval_scores"])
+
+
+class OOMError(RuntimeError):
+    pass
 
 
 class TrainingTask:
@@ -32,10 +40,48 @@ class TrainingTask:
         self.name = name
         self.iterator = dataset.get_iterator(shuffle=True, repeat=True)
         self.writer = SummaryWriter(os.path.join(report_dir, self.name))
+        self.logger = logging.getLogger(name)
 
     def get_output_and_loss(self, batch: Batch) -> (dict, Tensor):
         model_output = self.model(batch)
         return model_output, self.loss(model_output)
+
+    def forward_backward_pass(self, batch, optimizer, delay_unscale=False):
+        try:
+            model_output, loss = self.get_output_and_loss(batch)
+        except RuntimeError as e:
+            if 'out of memory' in str(e) or 'get_temporary_buffer' in str(e):
+                stats = [f"CUDA OOM on forward {self.iterator.iterations}",
+                         f"Batch size {batch.batch_size} {self.dataset.sample_name}s"] + \
+                        [f"{k}: {v}" for k, v in self.dataset.get_batch_stats(batch).items()]
+                raise OOMError(" | ".join(stats)) from e
+            else:
+                raise e
+
+        with torch.no_grad():
+            nll = model_output["nll"].sum().item()
+            batch_size = model_output["nll"].ne(0.0).sum().item()
+        del model_output
+
+        if self.logger.getEffectiveLevel() <= logging.DEBUG:
+            stats = [f"Step {self.iterator.iterations}: {self.dataset.sample_name}s",
+                     f"ppl {math.exp(nll / batch_size):.2f}",
+                     f"Batch size {batch.batch_size} {self.dataset.sample_name}s"] + \
+                    [f"{k}: {v}" for k, v in self.dataset.get_batch_stats(batch).items()]
+            self.logger.debug(" | ".join(stats))
+
+        try:
+            with amp.scale_loss(loss, optimizer, delay_unscale=delay_unscale) as scaled_loss:
+                scaled_loss.backward()
+        except RuntimeError as e:
+            if 'out of memory' in str(e) or 'get_temporary_buffer' in str(e):
+                stats = [f"CUDA OOM on backward {self.iterator.iterations}",
+                         f"Batch size {batch.batch_size} {self.dataset.sample_name}s"] + \
+                        [f"{k}: {v}" for k, v in self.dataset.get_batch_stats(batch).items()]
+                raise OOMError(" | ".join(stats)) from e
+            else:
+                raise e
+        return nll, batch_size
 
     def evaluate(self, step_num=None) -> CheckpointReport:
         dev_scores = []
