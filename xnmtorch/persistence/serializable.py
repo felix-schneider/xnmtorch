@@ -396,7 +396,10 @@ class UninitializedYamlObject:
         if self.obj is not None:
             return self.obj
         # check types
-        assert not any(isinstance(param, UninitializedYamlObject) for param in self.yaml_args.values())
+        if any(isinstance(param, UninitializedYamlObject) for param in self.yaml_args.values()):
+            cls_name = next(p.cls.__name__ for p in self.yaml_args.values() if isinstance(p, UninitializedYamlObject))
+            raise DeserializeError(f"In deserialization of {self.cls.__name__}: "
+                                   f"found uninitialized yaml object of type {cls_name}")
         try:
             obj = self.cls(**self.yaml_args)
         except Exception as e:
