@@ -68,7 +68,8 @@ class DecodingEvalTask(EvalTask, Serializable):
                  name="dev",
                  report_dir=Ref("exp_global.report_dir"),
                  result_path: Optional[str] = None,
-                 print_output=False):
+                 print_output=False,
+                 report_every=100):
         super().__init__(name, report_dir)
         self.dataset = dataset
         if not isinstance(metrics, Sequence):
@@ -79,6 +80,7 @@ class DecodingEvalTask(EvalTask, Serializable):
         self.result_path = result_path
         self.print_output = print_output
         self.result_file = None
+        self.report_every = report_every
 
     @torch.no_grad()
     def eval(self, step_num=None) -> Sequence[Metric]:
@@ -93,6 +95,8 @@ class DecodingEvalTask(EvalTask, Serializable):
             for i, batch in enumerate(iterator):
                 if i == 0:
                     self.logger.info("Batching complete, evaluating")
+                elif (i+1) % self.report_every == 0:
+                    self.logger.info(f"Batch {i+1}")
                 total_samples += batch.batch_size
                 res = self.model.inference(batch, self.search_strategy)
                 batch_results = [search_outputs[0]["outputs"] for search_outputs in res]
@@ -100,9 +104,10 @@ class DecodingEvalTask(EvalTask, Serializable):
                     print("\n".join(batch_results))
                 self.write_results(batch_results)
                 if len(self.metrics) != 0:
-                    results.extend(batch_results)
-                if "ref" in res[0][0]:
-                    references.extend(search_outputs[0]["ref"] for search_outputs in res)
+                    results.extend(self.model.postprocess_output(x) for x in batch_results)
+                    if "ref" in res[0][0]:
+                        references.extend(self.model.postprocess_output(search_outputs[0]["ref"])
+                                          for search_outputs in res)
                 self.logger.debug(f"{i}: {batch.batch_size} {self.dataset.sample_name}s")
         finally:
             if self.result_file is not None:

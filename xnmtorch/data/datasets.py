@@ -43,9 +43,11 @@ class BaseTranslationDataset(Dataset):
         self.level = level
         self.has_target = has_target
 
-    @staticmethod
-    def sort_key(ex):
-        return len(ex.trg), len(ex.src)
+    def sort_key(self, ex):
+        if self.has_target:
+            return len(ex.trg), len(ex.src)
+        else:
+            return len(ex.src)
 
     def get_sample_size(self, sample_len, current_count, current_size):
         if current_count == 0:
@@ -61,8 +63,11 @@ class BaseTranslationDataset(Dataset):
 
     def get_batch_size(self, example_index, current_count, current_size):
         new_example = self[example_index]
-        return max(self.get_sample_size(len(new_example.src), current_count, current_size),
-                   self.get_sample_size(len(new_example.trg) + 1, current_count, current_size))
+        batch_size = self.get_sample_size(len(new_example.src), current_count, current_size)
+        if self.has_target:
+            batch_size = max(batch_size,
+                             self.get_sample_size(len(new_example.trg) + 1, current_count, current_size))
+        return batch_size
 
     def get_iterator(self, shuffle=False, repeat=False) -> Iterator:
         device = None
@@ -86,9 +91,12 @@ class BaseTranslationDataset(Dataset):
     @torch.no_grad()
     def get_batch_stats(self, batch):
         src_idx, src_len = batch.src
-        trg_idx, trg_len = batch.trg
-        return {f"source {self.level}s": sum(src_len), f"target {self.level}s": sum(trg_len),
+        batch_stats = {f"source {self.level}s": sum(src_len),
                 "num_samples": len(src_len)}
+        if self.has_target:
+            trg_idx, trg_len = batch.trg
+            batch_stats[f"target {self.level}s"] = sum(trg_len)
+        return batch_stats
 
     def postprocess(self, length, samples, vocab):
         # already padded
@@ -223,23 +231,31 @@ class H5TranslationDataset(BaseTranslationDataset, TorchTextDataset, Serializabl
         self.src_vocab = src_vocab
         self.trg_vocab = trg_vocab
         import h5py
-        src = Field(batch_first=batch_first, include_lengths=True,
-                    postprocessing=self.postprocess_src, use_vocab=False, pad_token=src_vocab.pad_index)
-        trg = Field(batch_first=batch_first, include_lengths=True,
-                    init_token=trg_vocab.bos_index, eos_token=trg_vocab.eos_index, pad_token=trg_vocab.pad_index,
-                    is_target=True, postprocessing=self.postprocess_trg, use_vocab=False)
-        trg.vocab = trg_vocab
         self.data = h5py.File(path, "r")
         self.src_lengths = self.data["src_len"][:]
-        self.trg_lengths = self.data["trg_len"][:]
-        fields = [("src", src), ("trg", trg)]
-        logger.info(f"Loading {path}")
+
+        src = Field(batch_first=batch_first, include_lengths=True,
+                    postprocessing=self.postprocess_src, use_vocab=False, pad_token=src_vocab.pad_index)
+
+        if "trg_len" in self.data:
+            logger.info(f"Loading {path}")
+            self.trg_lengths = self.data["trg_len"][:]
+            trg = Field(batch_first=batch_first, include_lengths=True,
+                        init_token=trg_vocab.bos_index, eos_token=trg_vocab.eos_index, pad_token=trg_vocab.pad_index,
+                        is_target=True, postprocessing=self.postprocess_trg, use_vocab=False)
+            trg.vocab = trg_vocab
+            fields = [("src", src), ("trg", trg)]
+            has_target = True
+        else:
+            logger.info(f"Loading monolingual {path}")
+            fields = [("src", src)]
+            has_target = False
 
         TorchTextDataset.__init__(self,
                                   self.ExampleWrapper(self.data["examples"], fields),
                                   fields)
         BaseTranslationDataset.__init__(self, batch_size, level, False, sort_within_batch, batch_by_words,
-                                        batch_first, multiple)
+                                        batch_first, multiple, has_target)
 
     def postprocess_src(self, samples, vocab):
         # Because of use_vocab=False, this function is always called with vocab=None
@@ -251,5 +267,9 @@ class H5TranslationDataset(BaseTranslationDataset, TorchTextDataset, Serializabl
         return samples
 
     def get_batch_size(self, example_index, current_count, current_size):
-        return max(self.get_sample_size(self.src_lengths[example_index], current_count, current_size),
-                   self.get_sample_size(self.trg_lengths[example_index] + 1, current_count, current_size))
+        batch_size = self.get_sample_size(self.src_lengths[example_index], current_count, current_size)
+        if self.has_target:
+            batch_size = max(batch_size,
+                             self.get_sample_size(self.trg_lengths[example_index] + 1, current_count, current_size))
+        return batch_size
+

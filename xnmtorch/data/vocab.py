@@ -50,13 +50,15 @@ class Vocab(TorchVocab, Serializable):
         return self.stoi[self.eos_token]
 
     def indices_to_str(self, indices):
-        tokens = [self.itos[x] for x in indices]
+        return " ".join(self.itos[x] for x in indices)
+
+    def postprocess(self, text):
         if self.bpe:
-            return bpe_re.sub("", " ".join(tokens))
+            return bpe_re.sub("", text)
         elif self.sentence_piece:
-            return "".join(tokens).replace('\u2581', ' ').lstrip()
+            return text.replace(" ", "").replace("\u2581", " ").lstrip()
         else:
-            return " ".join(tokens)
+            return text
 
     def state_dict(self):
         return {"words": self.itos}
