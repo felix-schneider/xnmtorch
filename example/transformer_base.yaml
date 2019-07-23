@@ -1,0 +1,76 @@
+
+!Experiment
+  exp_global: !ExpGlobal
+    default_layer_dim: 512
+    dropout: 0.1
+    # multiple: 8  # Use on pascal or newer GPU to make use of tensor cores
+    save_num_checkpoints: 3
+    checkpoint_dir: checkpoints  # default
+    report_dir: reports          # default
+  model: !TranslationModel
+    src_vocab: &voc !Vocab
+      path: "vocab.encs"
+      sentence_piece: true
+      # bpe: true
+    trg_vocab: *voc  # vocab sharing through yaml reference
+    src_embedding: &emb !StandardWordEmbedding
+      vocab: *voc
+      dropout: 0.0
+    trg_embedding: *emb
+    encoder: !TransformerEncoder
+      num_layers: 6
+      feed_forward: !FeedForward
+        hidden_dim: 2048
+    decoder: !TransformerDecoder
+      num_layers: 6
+      feed_forward: !FeedForward
+        hidden_dim: 2048
+    generator: !DefaultGenerator
+      embedding: *emb
+  train: !SimpleTrainingRegimen
+    dataset: !H5TranslationDataset  # for large datasets (>5M samples), I recommend binarization
+      path: "train_h5.h5"
+      batch_size: 6000
+#    dataset: !TranslationDataset
+#      path: "data/train"
+#      extensions: [".en", ".cs"]
+#      sort: true
+#      batch_size: 6000
+    loss: !MLELoss
+      label_smoothing: 0.1
+    # optimizer: !Adafactor {}
+    optimizer: !Adam
+      beta1: 0.9
+      beta2: 0.997
+      eps: 1.0e-9
+    scheduler: !NoamLearningRate
+      # warmup_steps: 10000  # for adafactor
+      warmup_steps: 8000
+      multiplier: 2   # remove for adafactor
+    update_every: 5  # should add up to batch size >= 25k
+    report_every: 100
+    dev_every: 2000
+    keep_checkpoints: recent  # default is best
+    dev_tasks:        # first task is primary metric
+      - !DecodingEvalTask
+          name: "indomain_decode"
+          dataset: !TranslationDataset
+            path: "data/mustc_test.devtest"
+            extensions: [".en", ".cs"]
+            batch_size: 32
+            batch_by_words: False
+          metrics: !BLEU {}
+          result_path: "results/indomain"
+      - !PerplexityEvalTask
+        name: "newsdev"
+        dataset: &dev !TranslationDataset
+          path: "data/newstest.devtest"
+          extensions: [".en", ".cs"]
+          batch_size: 32
+          batch_by_words: false
+      - !DecodingEvalTask
+        name: "newsdev_decode"
+        dataset: *dev
+        metrics: !BLEU {}
+        search_strategy: !BeamSearch {beam_size: 5}
+        result_path: "results/newsdev"
