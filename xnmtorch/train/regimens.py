@@ -38,6 +38,9 @@ class TrainingRegimen:
     def optimizer(self):
         raise NotImplementedError
 
+    def initialize_model(self):
+        raise NotImplementedError
+
 
 def print_tensors():
     for obj in gc.get_objects():
@@ -111,10 +114,11 @@ class SimpleTrainingRegimen(TrainingTask, TrainingRegimen, Serializable):
         except KeyboardInterrupt:
             self.logger.info("Canceled checkpoint")
 
+    def initialize_model(self):
+        self.model.initialize(self.optimizer)
+
     # noinspection PyProtectedMember
     def train_loop(self, save_fct):
-        amp.initialize(self.model, self.optimizer, enabled=settings.CUDA, opt_level=settings.FP16)
-
         num_params = sum(p.numel() for p in amp.master_params(self.optimizer))
         self.logger.info(f"{num_params:,d} parameters")
         self.logger.info(f"{len(self.dataset):,d} training examples")
@@ -231,8 +235,8 @@ class SimpleTrainingRegimen(TrainingTask, TrainingRegimen, Serializable):
     def checkpoint(self, save_fct: Callable):
         dev_report = self.evaluate(step_num=self.step_num)
         self.logger.info(str(dev_report))
-        if dev_report.has_improved:
-            save_fct(dev_report)
+        # if dev_report.has_improved:
+        save_fct(dev_report)
 
     def state_dict(self) -> dict:
         state_dict = super().state_dict()

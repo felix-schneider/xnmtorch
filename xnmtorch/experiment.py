@@ -1,3 +1,4 @@
+import logging
 import os
 from pickle import UnpicklingError
 from typing import Sequence, Union, Optional
@@ -14,6 +15,9 @@ from xnmtorch.models import Model
 from xnmtorch.persistence.serializable import Serializable, UninitializedYamlObject
 from xnmtorch.train.regimens import TrainingRegimen
 from xnmtorch.train.train_tasks import CheckpointReport
+
+
+logger = logging.getLogger("experiment")
 
 
 class ExpGlobal(Serializable):
@@ -39,7 +43,8 @@ class Experiment(Serializable):
                  exp_global: ExpGlobal,
                  model: Model,
                  train: Optional[TrainingRegimen] = None,
-                 evaluate: Optional[Union[EvalTask, Sequence[EvalTask]]] = None,):
+                 evaluate: Optional[Union[EvalTask, Sequence[EvalTask]]] = None,
+                 keep_checkpoints="best"):
         self.exp_global = exp_global
         self.model = model
         if settings.CUDA:
@@ -49,6 +54,8 @@ class Experiment(Serializable):
         if evaluate is not None and not isinstance(evaluate, Sequence):
             evaluate = [evaluate]
         self.evaluate = evaluate
+        self.keep_checkpoints = keep_checkpoints
+        assert keep_checkpoints in ("best", "recent")
 
     @classmethod
     def load_experiment(cls, filename, spec_filename=None, for_training=False):
@@ -111,9 +118,16 @@ class Experiment(Serializable):
         filename = f"checkpoint_{str(primary_metric).replace(' ', '_')}_{self.train.step_num}.pt"
 
         existing_checkpoints = os.listdir(cp_dir)
+        logger.info(f"Saving checkpoint as {filename}")
         if len(existing_checkpoints) >= self.exp_global.save_num_checkpoints:
-            worst = sorted(existing_checkpoints)[0 if primary_metric.higher_is_better else -1]
-            os.remove(os.path.join(cp_dir, worst))
+            if self.keep_checkpoints == "best":
+                worst = sorted(existing_checkpoints)[0 if primary_metric.higher_is_better else -1]
+                logger.info(f"Removing {worst}")
+                os.remove(os.path.join(cp_dir, worst))
+            else:
+                oldest = min(existing_checkpoints, key=lambda x: os.path.getctime(os.path.join(cp_dir, x)))
+                logger.info(f"Removing {oldest}")
+                os.remove(os.path.join(cp_dir, oldest))
 
         spec = self.dump()
         state = self.state_dict()
@@ -134,7 +148,10 @@ class Experiment(Serializable):
 
     def __call__(self) -> Sequence[Metric]:
         if self.train is not None:
+            self.train.initialize_model()
             self.train.run_training(save_fct=self.save)
+        else:
+            self.model.initialize()
 
         eval_scores = []
         if self.evaluate is not None:

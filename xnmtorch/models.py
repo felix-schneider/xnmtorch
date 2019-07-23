@@ -1,6 +1,8 @@
+from apex import amp
 from torch import nn, Tensor
 from torchtext.data import Batch
 
+from xnmtorch import settings
 from xnmtorch.data.vocab import Vocab
 from xnmtorch.eval.search_strategies import SearchStrategy, GreedySearch
 from xnmtorch.modules.embeddings import WordEmbedding
@@ -10,11 +12,20 @@ from xnmtorch.persistence import Serializable
 
 
 class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self._initialized = False
+
     def forward(self, input: Batch):
         raise NotImplementedError
 
     def inference(self, input: Batch):
         return self(input)
+
+    def initialize(self, optimizer=None):
+        if not self._initialized:
+            amp.initialize(self, optimizer, enabled=settings.CUDA, opt_level=settings.FP16)
+        self._initialized = True
 
 
 class AutoregressiveModel(Model):
@@ -40,6 +51,9 @@ class AutoregressiveModel(Model):
 
     def get_finish_mask(self, scores, outputs):
         raise NotImplementedError
+
+    def postprocess_output(self, output):
+        return output
 
 
 class TranslationModel(AutoregressiveModel, Serializable):
@@ -91,7 +105,7 @@ class TranslationModel(AutoregressiveModel, Serializable):
 
         for sample in output:
             for search_output in sample:
-                search_output["outputs"] = self.trg_vocab.indices_to_str(search_output["outputs"][:-1]).capitalize()
+                search_output["outputs"] = self.trg_vocab.indices_to_str(search_output["outputs"][:-1])
 
         if hasattr(input, "trg"):
             for sample, ref, ref_len in zip(output, *input.trg):
@@ -100,6 +114,9 @@ class TranslationModel(AutoregressiveModel, Serializable):
                     search_output["ref"] = ref_str
 
         return output
+
+    def postprocess_output(self, output):
+        return self.trg_vocab.postprocess(output)
 
     def inference_step(self, input: Tensor, state: dict):
         if input is None:
