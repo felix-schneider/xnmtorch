@@ -12,30 +12,17 @@ class SearchStrategy:
         raise NotImplementedError
 
 
-class GreedySearch(SearchStrategy, Serializable):
-    def __init__(self, max_len=100):
-        self.max_len = max_len
-
-    def generate_output(self, model: 'AutoregressiveModel', initial_state: dict, src_lengths):
-        score = []
-        state = initial_state
-        scores = generate_fn(None, state)
-        outputs = []
-        for current_length in range(self.max_len):
-            best_idx = torch.argmax(scores, dim=0)
-            outputs.append(scores[best_idx])
-            if finish_mask_fn(scores)[best_idx].item():
-                break
-
-
-class BeamSearch(SearchStrategy, Serializable):
+class BaseBeamSearch(SearchStrategy):
     def __init__(self, beam_size, min_len=1, max_len_a=0.0, max_len_b=100, length_penalty=0.0, stop_early=True):
         self.beam_size = beam_size
         self.min_len = min_len
         self.max_len_a = max_len_a
         self.max_len_b = max_len_b
-        self.length_penalty = length_penalty
         self.stop_early = stop_early
+        self.length_penalty = length_penalty
+
+    def search_strategy(self, step, lprobs, scores, batch_size):
+        raise NotImplementedError
 
     def generate_output(self, model: 'AutoregressiveModel', initial_state: dict, src_lengths):
         batch_size = len(src_lengths)
@@ -48,16 +35,16 @@ class BeamSearch(SearchStrategy, Serializable):
         # batch_size, num_outputs
         all_scores = model.inference_step(None, state)
 
-        candidate_scores, candidate_outputs = torch.topk(all_scores, num_candidates_per_step)
-        candidate_beam_indices = candidate_outputs.new_zeros((batch_size, num_candidates_per_step))
-        candidate_finish_mask = model.get_finish_mask(candidate_scores, candidate_outputs)
+        # Cumulative best scores of unfinished beams
+        scores = all_scores.new_full((batch_size * self.beam_size,), 0)
 
+        candidate_scores, candidate_outputs, candidate_beam_indices = \
+            self.search_strategy(0, all_scores, scores, batch_size)
+
+        candidate_finish_mask = model.get_finish_mask(candidate_scores, candidate_outputs)
         model.reorder_state(state, torch.arange(batch_size, dtype=candidate_outputs.dtype,
                                                 device=candidate_outputs.device)
                             .repeat_interleave(self.beam_size))
-
-        # Cumulative best scores of unfinished beams
-        scores = candidate_scores.new_full((batch_size * self.beam_size,), 0)
         # History of best outputs of unfinished beams
         outputs = candidate_outputs.new_full((batch_size * self.beam_size, max_len), 0)
         # Back buffer, will be swapped with outputs
@@ -248,18 +235,8 @@ class BeamSearch(SearchStrategy, Serializable):
                 # batch_size*beam_size, vocab_size
                 all_scores = model.inference_step(outputs[:, step], state)
 
-                # make probs contain cumulative scores for each hypothesis
-                all_scores.add_(scores.unsqueeze(-1))
-
-                num_classes = all_scores.size(-1)
-
-                torch.topk(
-                    all_scores.view(batch_size, -1),
-                    k=num_candidates_per_step,
-                    out=(candidate_scores, candidate_outputs)
-                )
-                candidate_beam_indices = torch.div(candidate_outputs, num_classes)
-                candidate_outputs.fmod_(num_classes)
+                candidate_scores, candidate_outputs, candidate_beam_indices = \
+                    self.search_strategy(step + 1, all_scores, scores, batch_size)
 
                 candidate_finish_mask = model.get_finish_mask(candidate_scores, candidate_outputs)
 
@@ -283,3 +260,82 @@ class BeamSearch(SearchStrategy, Serializable):
             search_outputs[sample] = sorted(search_outputs[sample], key=lambda r: r["score"], reverse=True)
 
         return search_outputs
+
+
+class Sampling(BaseBeamSearch, Serializable):
+    def __init__(self, beam_size,
+                 min_len=1,
+                 max_len_a=0.0,
+                 max_len_b=100,
+                 length_penalty=0.0,
+                 stop_early=True):
+        super().__init__(beam_size, min_len, max_len_a, max_len_b, length_penalty, stop_early)
+
+    def search_strategy(self, step, lprobs, scores, batch_size):
+        lprobs.exp_()
+
+        if step == 0:
+            candidate_outputs = torch.multinomial(
+                lprobs,
+                self.beam_size,
+                replacement=True
+            ).view(batch_size, self.beam_size)
+            lprobs = lprobs.unsqueeze(1).expand(batch_size, self.beam_size, -1)
+        else:
+            candidate_outputs = torch.multinomial(
+                lprobs,
+                1,
+                replacement=True,
+            ).view(batch_size, self.beam_size)
+            lprobs = lprobs.view(batch_size, self.beam_size, -1)
+
+        candidate_scores = torch.gather(
+            lprobs,
+            dim=2,
+            index=candidate_outputs.unsqueeze(-1)
+        )
+        candidate_scores = candidate_scores.log_().view(batch_size, -1)
+
+        if step == 0:
+            candidate_beam_indices = candidate_outputs.new_zeros(candidate_scores.size())
+        else:
+            candidate_beam_indices = torch.arange(0, self.beam_size, device=candidate_scores.device)\
+                .repeat(batch_size, 1)
+
+            candidate_scores.add_(
+                torch.gather(
+                    scores.view(batch_size, -1),
+                    dim=1,
+                    index=candidate_beam_indices
+                )
+            )
+
+        return candidate_scores, candidate_outputs, candidate_beam_indices
+
+
+class BeamSearch(BaseBeamSearch, Serializable):
+    def __init__(self, beam_size,
+                 min_len=1,
+                 max_len_a=0.0,
+                 max_len_b=100,
+                 length_penalty=0.0,
+                 stop_early=True):
+        super().__init__(beam_size, min_len, max_len_a, max_len_b, length_penalty, stop_early)
+
+    def search_strategy(self, step, lprobs, scores, batch_size):
+        if step != 0:
+            lprobs.add_(scores.unsqueeze(-1))
+
+        candidate_scores, candidate_outputs = torch.topk(lprobs.view(batch_size, -1),
+                                                         2 * self.beam_size)
+
+        if step == 0:
+            candidate_beam_indices = candidate_outputs.new_zeros(candidate_scores.size())
+        else:
+            num_classes = lprobs.size(-1)
+            candidate_beam_indices = torch.div(candidate_outputs, num_classes)
+            candidate_outputs.fmod_(num_classes)
+
+        return candidate_scores, candidate_outputs, candidate_beam_indices
+
+
