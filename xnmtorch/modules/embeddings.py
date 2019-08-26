@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -77,26 +78,46 @@ class StandardWordEmbedding(DenseWordEmbedding, Serializable):
 
 
 class PreTrainedWordEmbedding(DenseWordEmbedding, Serializable):
-    def __init__(self, vocab, path, freeze=False, dropout=0.0):
+    def __init__(self, vocab,
+                 path,
+                 freeze=False,
+                 dropout: float = Ref("exp_global.dropout")):
         super().__init__()
         self.vocab = vocab
         self.path = path
         self.freeze = freeze
         self.dropout = dropout
-        self.embeddings = self.register_parameter("embeddings", None)
-        self.reset_parameters()
+        requires_grad = not self.freeze
+        if self.path is not None:
+            self.word_embeddings = nn.Parameter(torch.as_tensor(np.load(self.path).astype(np.float32)), requires_grad)
+            self.special_embeddings = nn.Parameter(torch.empty((self.vocab.num_specials, self.word_embeddings.size(-1))))
+            NormalInitializer().initialize(self.special_embeddings)
+        else:
+            self.word_embeddings = nn.Parameter(torch.Tensor(), requires_grad)
+            self.special_embeddings = nn.Parameter(torch.Tensor())
+
         self.save_processed_arg("path", None)
 
-    def reset_parameters(self):
-        if self.path is not None:
-            raise NotImplementedError
+        self._register_load_state_dict_pre_hook(self._fix_embedding_size)
 
     @property
     def weights(self):
-        return self.embeddings
+        return torch.cat((self.special_embeddings, self.word_embeddings))
 
     def forward(self, inputs):
         if self.dropout > 0 and self.training:
-            return embedding_dropout(inputs, self.dropout, self.embeddings, self.vocab.pad_index)
+            return embedding_dropout(inputs, self.dropout, self.weights, self.vocab.pad_index)
         else:
-            return F.embedding(input, self.embeddings, self.vocab.pad_index)
+            return F.embedding(inputs, self.weights, self.vocab.pad_index)
+
+    def _fix_embedding_size(self, state_dict, prefix, local_metadata, strict,
+                            missing_keys, unexpected_keys, error_msgs):
+        old_emb = state_dict[prefix + "word_embeddings"]
+        self.special_embeddings.requires_grad_(False)
+        if not self.freeze:
+            self.word_embeddings.requires_grad_(False)
+        self.word_embeddings.resize_(*list(old_emb.size()))
+        self.special_embeddings.resize_((self.vocab.num_specials, old_emb.size(-1)))
+        self.special_embeddings.requires_grad_(True)
+        if not self.freeze:
+            self.word_embeddings.requires_grad_(True)

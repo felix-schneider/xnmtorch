@@ -48,7 +48,10 @@ class ConstantLearningRate(LearningRateScheduler, Serializable):
 
 
 class NoamLearningRate(LearningRateScheduler, Serializable):
-    def __init__(self, warmup_steps, model_size=Ref("exp_global.default_layer_dim"), multiplier=1.0):
+    def __init__(self,
+                 warmup_steps,
+                 model_size=Ref("exp_global.default_layer_dim"),
+                 multiplier=1.0):
         self.init_lr = model_size ** (-0.5) * multiplier
         self.lr = self.init_lr
         self.step = 0

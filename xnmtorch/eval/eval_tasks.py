@@ -3,12 +3,13 @@ import os
 from datetime import datetime
 from typing import Sequence, Union, Optional
 
+import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from xnmtorch import settings, logging
 from xnmtorch.data.datasets import Dataset
-from xnmtorch.eval.metrics import Metric, Perplexity, Evaluator
+from xnmtorch.eval.metrics import Metric, Perplexity, Evaluator, ScalarMetric
 from xnmtorch.eval.search_strategies import SearchStrategy, BeamSearch
 from xnmtorch.models import Model, AutoregressiveModel
 from xnmtorch.persistence import Serializable, Ref
@@ -57,6 +58,53 @@ class PerplexityEvalTask(EvalTask, Serializable):
                          f"{total_samples / total_time.total_seconds():.1f} {self.dataset.sample_name}s/s")
         self.logger.info(str(metric))
         return [metric]
+
+
+class ClassifierAccuracyTask(EvalTask, Serializable):
+    def __init__(self,
+                 dataset: Dataset,
+                 model: Model = Ref("model"),
+                 name="dev",
+                 report_dir=Ref("exp_global.report_dir"),
+                 target_field_name="target",
+                 result_path: Optional[str] = None):
+        super().__init__(name, report_dir)
+        self.dataset = dataset
+        self.model = model
+        self.target_field_name = target_field_name
+        self.result_path = result_path
+
+    @torch.no_grad()
+    def eval(self, step_num=None) -> Sequence[Metric]:
+        self.logger.info(f"Starting {self.name}")
+        self.model.eval()
+        start_time = datetime.now()
+        total_correct = 0
+        total_loss = 0
+        total_losses = 0
+        total_samples = 0
+        all_predictions = []
+        for i, batch in enumerate(self.dataset.get_iterator(shuffle=False, repeat=False)):
+            model_outputs = self.model(batch)
+            predictions = model_outputs["log_probs"].argmax(-1)
+            all_predictions.extend(predictions.tolist())
+            total_correct += predictions.eq(getattr(batch, self.target_field_name)).sum().item()
+            total_loss += model_outputs["nll"].sum().item()
+            total_losses += model_outputs["nll"].ne(0.0).sum().item()
+            total_samples += batch.batch_size
+        accuracy = ScalarMetric("accuracy", total_correct / total_samples * 100)
+        accuracy.write_value(self.writer, step_num)
+        perplexity = Perplexity(total_loss, total_losses)
+        perplexity.write_value(self.writer, step_num)
+        total_time = datetime.now() - start_time
+        self.logger.info(f"{self.name} complete in {total_time}. "
+                         f"{total_samples / total_time.total_seconds():.1f} {self.dataset.sample_name}s/s")
+        self.logger.info(f"{accuracy} | {perplexity}")
+
+        if self.result_path is not None:
+            np.save(self.result_path, np.asarray(all_predictions))
+
+        return [accuracy, perplexity]
 
 
 class DecodingEvalTask(EvalTask, Serializable):

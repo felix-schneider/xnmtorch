@@ -256,3 +256,41 @@ class MultiHeadAttention(nn.Module, Serializable):
         for k in input_buffer.keys():
             input_buffer[k] = input_buffer[k].index_select(0, new_order)
         state[id(self)] = input_buffer
+
+    @property
+    def output_dim(self):
+        return self.model_dim
+
+
+class TrilinearAttention(nn.Module, Serializable):
+    def __init__(self,
+                 model_dim: int = Ref("exp_global.default_layer_dim"),
+                 batch_first=True):
+        super().__init__()
+        if not batch_first:
+            raise NotImplementedError
+        self.model_dim = model_dim
+        self.weights = nn.Parameter(torch.zeros((model_dim,)))
+        self.bias = nn.Parameter(torch.zeros(()))
+        self.paragraph_transform = Linear(model_dim, 1)
+        self.question_transform = Linear(model_dim, 1)
+
+    @property
+    def output_dim(self):
+        return 3 * self.model_dim
+
+    def forward(self, questions, question_mask, paragraphs, paragraph_mask):
+        questions = questions.unsqueeze(1)
+        question_mask = 1 - question_mask
+        question_mask = question_mask.unsqueeze(1)
+        # questions: (batch_size, 1, q_maxlen, model_size)
+        # paragraphs: (batch_size, ratio, p_maxlen, model_size)
+        A = self.paragraph_transform(paragraphs)  # (batch_size, 1, q_maxlen, 1)
+        B = self.question_transform(questions).transpose(2, 3)  # (batch_size, ratio, 1, p_maxlen)
+        C = torch.matmul(paragraphs * self.weights, questions.transpose(2, 3))  # (batch_size, ratio, p_maxlen, q_maxlen)
+        similarities = A + B + C + self.bias  # (batch_size, ratio, p_maxlen, q_maxlen)
+        similarities = similarities.masked_fill(question_mask.unsqueeze(2), -1e20)
+        similarities = torch.softmax(similarities, -1)
+        context2query = torch.matmul(similarities, questions)
+        outputs = [paragraphs, context2query, context2query * paragraphs]
+        return torch.cat(outputs, -1)

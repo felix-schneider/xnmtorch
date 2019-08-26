@@ -119,8 +119,8 @@ class SimpleTrainingRegimen(TrainingTask, TrainingRegimen, Serializable):
 
     # noinspection PyProtectedMember
     def train_loop(self, save_fct):
-        num_params = sum(p.numel() for p in amp.master_params(self.optimizer))
-        self.logger.info(f"{num_params:,d} parameters")
+        num_params = sum(p.numel() for p in amp.master_params(self.optimizer) if p.requires_grad)
+        self.logger.info(f"{num_params:,d} trainable parameters")
         self.logger.info(f"{len(self.dataset):,d} training examples")
         for task in self.dev_tasks:
             if hasattr(task, "dataset"):
@@ -140,8 +140,6 @@ class SimpleTrainingRegimen(TrainingTask, TrainingRegimen, Serializable):
             if self.num_training_steps is not None and \
                     self.current_training_steps >= self.num_training_steps:
                 break
-            elif i == 0:
-                self.logger.info("Starting training")
 
             train_this_step = self.update_every is None or backward_steps % self.update_every == 0
 
@@ -179,6 +177,8 @@ class SimpleTrainingRegimen(TrainingTask, TrainingRegimen, Serializable):
                 if self.max_grad_norm is not None:
                     grad_norm = nn.utils.clip_grad_norm_(amp.master_params(self.optimizer), self.max_grad_norm)
 
+                self.set_learning_rate(self.scheduler.update_step())
+
                 if self.report_every is not None and self.current_training_steps % self.report_every == 0:
                     if self.max_grad_norm is None:
                         grad_norm = math.sqrt(sum(p.grad.norm() ** 2 for p in amp.master_params(self.optimizer)
@@ -209,7 +209,6 @@ class SimpleTrainingRegimen(TrainingTask, TrainingRegimen, Serializable):
                     self.current_epoch += 1
                     self.set_learning_rate(self.scheduler.update_epoch())
 
-                self.set_learning_rate(self.scheduler.update_step())
                 last_index = current_index
                 self.optimizer.zero_grad()
                 total_loss = 0

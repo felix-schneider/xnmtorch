@@ -101,10 +101,6 @@ class BLEU(Evaluator, Serializable):
         self.lowercase = lowercase
 
     def evaluate(self, hypotheses, references):
-        if self.lowercase:
-            hypotheses = map(str.lower, hypotheses)
-            references = map(str.lower, references)
-
         import sacrebleu
-        bleu = sacrebleu.raw_corpus_bleu(hypotheses, [references])
+        bleu = sacrebleu.corpus_bleu(hypotheses, [references], lowercase=self.lowercase)
         return BLEUScore(bleu.score, self.lowercase)

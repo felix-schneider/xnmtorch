@@ -2,7 +2,7 @@ import logging
 import os
 
 import torch
-from torchtext.data import Field, Dataset as TorchTextDataset, Example
+from torchtext.data import Field, Dataset as TorchTextDataset, Example, NestedField
 
 from xnmtorch import settings
 from xnmtorch.data.iterators import Iterator, BatchShuffledIterator
@@ -92,7 +92,7 @@ class BaseTranslationDataset(Dataset):
     def get_batch_stats(self, batch):
         src_idx, src_len = batch.src
         batch_stats = {f"source {self.level}s": sum(src_len),
-                "num_samples": len(src_len)}
+                       "num_samples": len(src_len)}
         if self.has_target:
             trg_idx, trg_len = batch.trg
             batch_stats[f"target {self.level}s"] = sum(trg_len)
@@ -243,7 +243,7 @@ class H5TranslationDataset(BaseTranslationDataset, TorchTextDataset, Serializabl
             trg = Field(batch_first=batch_first, include_lengths=True,
                         init_token=trg_vocab.bos_index, eos_token=trg_vocab.eos_index, pad_token=trg_vocab.pad_index,
                         is_target=True, postprocessing=self.postprocess_trg, use_vocab=False)
-            trg.vocab = trg_vocab
+            # trg.vocab = trg_vocab
             fields = [("src", src), ("trg", trg)]
             has_target = True
         else:
@@ -272,4 +272,114 @@ class H5TranslationDataset(BaseTranslationDataset, TorchTextDataset, Serializabl
             batch_size = max(batch_size,
                              self.get_sample_size(self.trg_lengths[example_index] + 1, current_count, current_size))
         return batch_size
+
+
+class BaseIRDataset(Dataset):
+    def __init__(self,
+                 ratio,
+                 batch_size,
+                 batch_first):
+        self.ratio = ratio
+        self.batch_size = batch_size
+        self.batch_first = batch_first
+
+    @torch.no_grad()
+    def get_batch_stats(self, batch):
+        q_idx, q_len = batch.question
+        idx, ratio, p_lens = batch.paragraphs
+
+        batch_stats = {"questions": len(q_len), "paragraphs": sum(map(len, p_lens)),
+                       "paragraph_words": p_lens.sum(), "paragraph_size": idx.size()}
+
+        return batch_stats
+
+    @property
+    def sample_name(self):
+        return "question"
+
+    def get_iterator(self, shuffle=False, repeat=False) -> Iterator:
+        device = None
+        if settings.CUDA:
+            device = "cuda"
+
+        return Iterator(self, self.batch_size, device=device,
+                        repeat=repeat, sort=False, shuffle=shuffle,
+                        sort_within_batch=False)
+
+
+class IRDataset(BaseIRDataset, TorchTextDataset, Serializable):
+    def __init__(self,
+                 question_path,
+                 paragraph_path,
+                 ratio,
+                 batch_size,
+                 vocab: Vocab = Ref("model.vocab"),
+                 batch_first=Ref("model.batch_first", True),
+                 ):
+        self.vocab = vocab
+        question = Field(include_lengths=True, batch_first=batch_first, pad_token=vocab.pad_token)
+        question.vocab = vocab
+        paragraph = Field(batch_first=batch_first, pad_token=vocab.pad_token)
+        paragraph.vocab = vocab
+        paragraphs = NestedField(paragraph, include_lengths=True)
+        paragraphs.vocab = vocab
+        target = Field(sequential=False, use_vocab=False, is_target=True)
+
+        fields = [("question", question), ("paragraphs", paragraphs), ("target", target)]
+        examples = []
+        with open(paragraph_path) as paragraph_file, open(question_path) as question_file:
+            for q in question_file:
+                q = q.strip()
+                ps = [paragraph_file.readline().strip() for _ in range(ratio)]
+                examples.append(Example.fromlist([q, ps, 0], fields))
+
+        BaseIRDataset.__init__(self, ratio, batch_size, batch_first)
+        TorchTextDataset.__init__(self, examples, fields)
+
+
+class H5IRDataset(BaseIRDataset, TorchTextDataset, Serializable):
+    class ExampleWrapper:
+        CACHE_SIZE = 20
+
+        def __init__(self, ds, ratio, fields):
+            self.fields = fields
+            self.ratio = ratio
+            self.ds = ds
+            self.cache_idx = 0
+            self.cache = self.ds[0:self.CACHE_SIZE]
+
+        def __getitem__(self, i):
+            if not (self.cache_idx <= i < self.cache_idx + self.CACHE_SIZE):
+                self.cache_idx = i
+                self.cache = self.ds[i:i + self.CACHE_SIZE]
+            example = list(self.cache[i - self.cache_idx])
+            example[1] = example[1].reshape(self.ratio, example[2])
+            example[2] = 0
+            return Example.fromlist(example, self.fields)
+
+        def __len__(self):
+            return len(self.ds)
+
+    def __init__(self,
+                 path,
+                 batch_size,
+                 vocab: Vocab = Ref("model.vocab"),
+                 batch_first=Ref("model.batch_first", True)):
+        self.vocab = vocab
+        question = Field(include_lengths=True, use_vocab=False, pad_token=vocab.pad_index, batch_first=batch_first)
+        paragraph = Field(batch_first=batch_first, pad_token=vocab.pad_index, use_vocab=False)
+        paragraphs = NestedField(paragraph, include_lengths=True)
+        target = Field(sequential=False, use_vocab=False, is_target=True)
+
+        fields = [("question", question), ("paragraphs", paragraphs), ("target", target)]
+
+        import h5py
+        self.data = h5py.File(path, "r")
+        ds = self.data["examples"]
+        ratio = ds.attrs["ratio"]
+
+        TorchTextDataset.__init__(self,
+                                  self.ExampleWrapper(ds, ratio, fields),
+                                  fields)
+        BaseIRDataset.__init__(self, ratio, batch_size, batch_first)
 
