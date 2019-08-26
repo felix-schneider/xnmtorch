@@ -1,0 +1,40 @@
+
+!Experiment
+  exp_global: !ExpGlobal
+    default_layer_dim: 300
+    dropout: 0.0
+    save_num_checkpoints: 5
+  model: !IRModel
+    vocab: !Vocab
+      path: "data/vocab"
+    embedding: !PreTrainedWordEmbedding
+      path: "data/word_embeddings.npy"
+      freeze: true
+      dropout: 0.0
+    paragraph_encoder: &enc !LSTM
+      bidirectional: True
+    question_encoder: *enc
+    attention: !TrilinearAttention {}
+    hidden_dim: 500
+  train: !SimpleTrainingRegimen
+    dataset: !H5IRDataset
+      path: "train.h5"
+      batch_size: 5
+    loss: !MLELoss {}
+    optimizer: !Adam
+      weight_decay: 1.e-4
+      beta1: 0.8
+      beta2: 0.999
+      eps: 1.0e-7
+    max_grad_norm: 1.0
+    num_training_steps: 50000
+    scheduler: !NoamLearningRate
+      warmup_steps: 1000
+    report_every: 100
+    dev_every: 1000
+    dev_tasks:
+      - !ClassifierAccuracyTask
+        name: "dev"
+        dataset: !H5IRDataset
+          path: "dev.h5"
+          batch_size: 10
