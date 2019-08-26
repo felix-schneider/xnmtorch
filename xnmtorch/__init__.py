@@ -17,6 +17,7 @@ import xnmtorch.modules.generators
 import xnmtorch.modules.initializers
 import xnmtorch.modules.linear
 import xnmtorch.modules.positional_encoding
+import xnmtorch.modules.rnn
 import xnmtorch.modules.transformer
 import xnmtorch.train.lr_schedulers
 import xnmtorch.train.optimizers

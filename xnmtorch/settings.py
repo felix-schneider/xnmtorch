@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 LOG_LEVEL_CONSOLE = "INFO"
-LOG_LEVEL_FILE = "DEBUG"
+LOG_LEVEL_FILE = "INFO"
 DEFAULT_CHECKPOINT_DIR = "checkpoints"
 DEFAULT_REPORT_DIR = "reports"
 DEFAULT_LOG_DIR = "logs"

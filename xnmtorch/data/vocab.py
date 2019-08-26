@@ -24,7 +24,7 @@ class Vocab(TorchVocab, Serializable):
             if not sentence_piece:
                 with open(path) as file:
                     for line in file:
-                        word, count = line.split()
+                        word, count = line.split(" ")
                         counter[word] = int(count)
             else:
                 with open(path) as file:
@@ -36,6 +36,7 @@ class Vocab(TorchVocab, Serializable):
         super().__init__(counter, specials=[self.unk_token, self.pad_token, self.bos_token, self.eos_token])
         self.bpe = bpe
         self.sentence_piece = sentence_piece
+        self.num_specials = 4
 
     @property
     def pad_index(self):

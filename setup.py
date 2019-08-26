@@ -1,4 +1,4 @@
-from setuptools import setup
+from setuptools import setup, find_packages
 
 import xnmtorch
 
@@ -12,6 +12,7 @@ setup(
     author="Felix Schneider",
     python_requires=">=3.6",
     install_requires=requirements,
+    packages=find_packages(),
     entry_points={
         "console_scripts": [
             "xnmtorch = xnmtorch.xnmtorch_run_experiment:main",
